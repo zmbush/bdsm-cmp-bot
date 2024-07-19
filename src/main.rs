@@ -13,6 +13,7 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{info, instrument};
 use tracing_subscriber::{layer::SubscriberExt as _, Layer as _, Registry};
 
+const RESULT_URL: &str = "https://bdsmtest.org/ajax/getresult";
 const MATCH_URL: &str = "https://bdsmtest.org/ajax/match";
 const REGISTRY: &str = "registry.json";
 
@@ -23,11 +24,44 @@ struct MatchResult {
     partner: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[allow(unused)]
+struct GetResultScore {
+    id: u32,
+    name: String,
+    pairdesc: String,
+    description: String,
+    score: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(unused)]
+struct GetResultResult {
+    langfile: String,
+    date: String,
+    version: u32,
+    gender: String,
+    auth: bool,
+    scores: Vec<GetResultScore>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct MatchRequest {
     #[serde(rename = "rauth[rid]")]
     person: String,
     partner: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct GetResultRequest {
+    #[serde(rename = "rauth[rid]")]
+    person: String,
+    #[serde(rename = "uauth[uid]")]
+    uid: &'static str,
+    #[serde(rename = "uauth[salt]")]
+    salt: &'static str,
+    #[serde(rename = "uauth[authsig]")]
+    authsig: &'static str,
 }
 
 #[derive(Clone, Default, Debug, Serialize, Deserialize)]
@@ -129,6 +163,7 @@ fn persist(data: &GlobalData) -> Result<(), anyhow::Error> {
         format!("registry-{}.json", now.timestamp()),
         20,
     )?;
+
     let mut output = std::fs::File::create(REGISTRY).context("while opening data file")?;
     serde_json::to_writer_pretty(&mut output, data).context("while formatting json")?;
 
@@ -151,12 +186,31 @@ fn persist(data: &GlobalData) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+async fn get_result<S: Into<String>>(user: S) -> Result<GetResultResult, anyhow::Error> {
+    let client = reqwest::Client::new();
+    let req = GetResultRequest {
+        person: user.into(),
+        uid: "0",
+        salt: "",
+        authsig: "814a69afc15258000678f00526b0c107ac271b5ea997beb4f7c1e81c861c972b",
+    };
+
+    Ok(client
+        .post(RESULT_URL)
+        .form(&req)
+        .send()
+        .await?
+        .json()
+        .await?)
+}
+
 async fn get_match(cache: &mut Cache, request: MatchRequest) -> Result<u32, anyhow::Error> {
     let cache_key = Matchup::from(request.clone());
     if let Some(score) = cache.0.get(&cache_key) {
         Ok(*score)
     } else {
         let client = reqwest::Client::new();
+
         let score = client
             .post(MATCH_URL)
             .form(&request)
@@ -312,6 +366,58 @@ async fn remove_bdsm_results(
     ctx.reply("Entries Removed")
         .await
         .context("while sending reply")?;
+
+    Ok(())
+}
+
+#[instrument(skip(ctx), err, fields(guild = ctx.guild().unwrap().name, user = ctx.author().name))]
+#[poise::command(slash_command, guild_only = true)]
+async fn show_result(
+    ctx: Context<'_>,
+    #[description = "Headmate Name"]
+    #[autocomplete = "autocomplete_headmate"]
+    headmate: Option<String>,
+) -> Result<(), anyhow::Error> {
+    ctx.defer().await?;
+
+    let guild_id = ctx
+        .guild_id()
+        .ok_or_else(|| anyhow::anyhow!("No guild id. Must be in a guild"))?;
+    let data = ctx.data().data.read().await;
+    let guild = data.guild(guild_id).ok_or_else(|| {
+        anyhow::anyhow!("No data registered for this guild, use add_bdsm_result first")
+    })?;
+
+    let person = guild.users.get(&ctx.author().id).ok_or_else(|| {
+        anyhow::anyhow!("You have not registered any results. Use add_bdsm_result first")
+    })?;
+    let headmate_data = person
+        .headmate(&headmate)
+        .ok_or_else(|| anyhow::anyhow!("Could not find headmate {headmate:?}"))?;
+    for result in headmate_data.results.values() {
+        let result = match get_result(result).await {
+            Ok(result) => result,
+            Err(e) => {
+                ctx.reply(format!("Could not get result for {result}: {e}"))
+                    .await?;
+                continue;
+            }
+        };
+        let mut response = format!(
+            "```==== {} {}({}) ====\n",
+            ctx.author().name,
+            if let Some(ref hm) = headmate {
+                format!("({hm}) ")
+            } else {
+                String::new()
+            },
+            result.date
+        );
+        for score in result.scores {
+            response += &format!("{:-30} {:02}%\n", score.name, score.score);
+        }
+        ctx.reply(response + "```").await?;
+    }
 
     Ok(())
 }
@@ -494,6 +600,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 add_bdsm_result(),
                 list_compatibility(),
                 remove_bdsm_results(),
+                show_result(),
             ],
             ..Default::default()
         })
