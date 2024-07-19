@@ -1,11 +1,11 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::io::Write;
 
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
 use poise::serenity_prelude as serenity;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 
 const MATCH_URL: &str = "https://bdsmtest.org/ajax/match";
 const REGISTRY: &str = "registry.toml";
@@ -13,6 +13,7 @@ const REGISTRY: &str = "registry.toml";
 #[derive(Debug, Deserialize)]
 struct MatchResult {
     score: u32,
+    #[allow(unused)]
     partner: String,
 }
 
@@ -49,6 +50,30 @@ struct GlobalData {
     guild: Vec<GuildData>,
 }
 
+fn persist(data: &GlobalData) -> Result<(), anyhow::Error> {
+    let mut output = std::fs::File::create(REGISTRY).context("while opening data file")?;
+    write!(
+        output,
+        "{}",
+        toml::to_string_pretty(data).context("While formatting toml")?
+    )
+    .context("While writing data to disk")?;
+
+    Ok(())
+}
+
+async fn get_match(request: MatchRequest) -> Result<u32, anyhow::Error> {
+    let client = reqwest::Client::new();
+    Ok(client
+        .post(MATCH_URL)
+        .form(&request)
+        .send()
+        .await?
+        .json::<MatchResult>()
+        .await?
+        .score)
+}
+
 type Context<'a> = poise::Context<'a, RwLock<GlobalData>, anyhow::Error>;
 #[poise::command(slash_command)]
 async fn add_bdsm_result(
@@ -79,7 +104,7 @@ async fn add_bdsm_result(
         let guild = data.guild.get_mut(guild_index).unwrap();
         let person_data = guild
             .person
-            .entry(ctx.author().id) //.get().to_string())
+            .entry(ctx.author().id)
             .or_insert_with(UserData::default);
         let headmate_index = person_data
             .0
@@ -96,15 +121,54 @@ async fn add_bdsm_result(
         headmate_data.results.insert(Utc::now(), id);
     }
 
-    let mut output = std::fs::File::create(REGISTRY).context("while opening data file")?;
-    write!(
-        output,
-        "{}",
-        toml::to_string_pretty(&*data).context("While formatting toml")?
-    )
-    .context("While writing data to disk")?;
+    persist(&data)?;
 
     ctx.reply("Result Saved")
+        .await
+        .context("while sending reply")?;
+
+    Ok(())
+}
+
+#[poise::command(slash_command)]
+/// Removes the entries for the current user (or one of their headmates)
+async fn remove_bdsm_results(
+    ctx: Context<'_>,
+    #[description = "Headmate Name"] headmate: Option<String>,
+) -> Result<(), anyhow::Error> {
+    let location_id = ctx
+        .guild_id()
+        .map(|g| g.get())
+        .unwrap_or(ctx.channel_id().get());
+    let mut data = ctx.data().write().await;
+
+    {
+        let guild_index = data
+            .guild
+            .iter()
+            .position(|guild| guild.guild_id == location_id)
+            .unwrap_or_else(|| {
+                data.guild.push(GuildData {
+                    guild_id: location_id,
+                    person: BTreeMap::new(),
+                });
+                data.guild.len() - 1
+            });
+        let guild = data.guild.get_mut(guild_index).unwrap();
+        let person_data = guild
+            .person
+            .entry(ctx.author().id)
+            .or_insert_with(UserData::default);
+        if let Some(headmate_index) = person_data.0.iter().position(|h| h.name == headmate) {
+            person_data.0.swap_remove(headmate_index);
+        } else {
+            return Err(anyhow::anyhow!("No entries found for ({headmate:?})"));
+        }
+    }
+
+    persist(&data)?;
+
+    ctx.reply("Entries removed")
         .await
         .context("while sending reply")?;
 
@@ -121,7 +185,7 @@ async fn list_compatibility(
         .guild_id()
         .map(|g| g.get())
         .unwrap_or(ctx.channel_id().get());
-    let mut data = ctx.data().read().await;
+    let data = ctx.data().read().await;
     let guild = data
         .guild
         .iter()
@@ -163,8 +227,9 @@ async fn list_compatibility(
                     .unwrap_or(ctx.author().name.clone()),
             })
     );
-    let client = reqwest::Client::new();
+    let mut results = Vec::new();
     for (&user_id, person) in &guild.person {
+        ctx.defer().await?;
         if user_id == ctx.author().id {
             continue;
         }
@@ -172,32 +237,40 @@ async fn list_compatibility(
             Some(g) => match g.member(ctx, user_id).await {
                 Ok(user) => user.display_name().to_string(),
                 Err(_) if user_id.get() == 1 => "".to_string(),
-                Err(_) => format!("Old user: {user_id}"),
+                Err(_) => "Deleted User".to_string(),
             },
             None => return Err(anyhow::anyhow!("Not in a guild")),
         };
 
         for headmate in &person.0 {
             let name = headmate.name.as_ref().unwrap_or(&member_name);
-
-            let resp = client
-                .post(MATCH_URL)
-                .form(&MatchRequest {
-                    person: most_recent.clone(),
-                    partner: headmate
-                        .results
-                        .iter()
-                        .max_by_key(|h| h.0)
-                        .expect("no partner result")
-                        .1
-                        .clone(),
-                })
-                .send()
-                .await?
-                .json::<MatchResult>()
-                .await?;
-            response += &format!("  x {name}: {:02}%\n", resp.score);
+            let score = get_match(MatchRequest {
+                person: most_recent.clone(),
+                partner: headmate
+                    .results
+                    .iter()
+                    .max_by_key(|h| h.0)
+                    .expect("no partner result")
+                    .1
+                    .clone(),
+            })
+            .await
+            .map(|score| score as i32)
+            .unwrap_or_else(|_| -1);
+            results.push((score, name.to_string()));
         }
+    }
+
+    results.sort_by_key(|(s, _)| -s);
+    for (score, name) in results {
+        response += &format!(
+            "- {name}: {}\n",
+            if score >= 0 {
+                format!("{score:02}%")
+            } else {
+                "Invalid Result".to_string()
+            }
+        );
     }
 
     ctx.reply(response).await?;
@@ -219,7 +292,11 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
-            commands: vec![add_bdsm_result(), list_compatibility()],
+            commands: vec![
+                add_bdsm_result(),
+                list_compatibility(),
+                remove_bdsm_results(),
+            ],
             ..Default::default()
         })
         .setup(|ctx, _ready, framework| {
@@ -237,27 +314,6 @@ async fn main() -> Result<(), anyhow::Error> {
         .framework(framework)
         .await;
     client.unwrap().start().await.unwrap();
-
-    // let results: TestResult = toml::from_str(&std::fs::read_to_string("registry.toml")?)?;
-    // println!("{:?}", results);
-    // let client = reqwest::Client::new();
-
-    // for (name, data) in &results.person {
-    //     let person = data.values().next().unwrap();
-    //     for (partner, data) in &results.person {
-    //         let resp = client
-    //             .post(MATCH_URL)
-    //             .form(&MatchRequest {
-    //                 person: person.clone(),
-    //                 partner: data.values().next().unwrap().clone(),
-    //             })
-    //             .send()
-    //             .await?
-    //             .json::<MatchResult>()
-    //             .await?;
-    //         println!("{name} x {partner}: {}", resp.score);
-    //     }
-    // }
 
     Ok(())
 }
