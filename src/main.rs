@@ -1,14 +1,12 @@
-use std::collections::BTreeMap;
-use std::io::Write;
+#![deny(unused)]
+
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
-use poise::{
-    serenity_prelude::{self as serenity, Mentionable},
-    CreateReply,
-};
+use poise::serenity_prelude::{self as serenity, Mentionable};
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 const MATCH_URL: &str = "https://bdsmtest.org/ajax/match";
 const REGISTRY: &str = "registry.json";
@@ -21,16 +19,11 @@ struct MatchResult {
     partner: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct MatchRequest {
     #[serde(rename = "rauth[rid]")]
     person: String,
     partner: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct TestResult {
-    person: BTreeMap<String, BTreeMap<DateTime<Utc>, String>>,
 }
 
 #[derive(Clone, Default, Debug, Serialize, Deserialize)]
@@ -109,19 +102,59 @@ fn persist(data: &GlobalData) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-async fn get_match(request: MatchRequest) -> Result<u32, anyhow::Error> {
-    let client = reqwest::Client::new();
-    Ok(client
-        .post(MATCH_URL)
-        .form(&request)
-        .send()
-        .await?
-        .json::<MatchResult>()
-        .await?
-        .score)
+async fn get_match(cache: &mut Cache, request: MatchRequest) -> Result<u32, anyhow::Error> {
+    let cache_key = Matchup::from(request.clone());
+    if let Some(score) = cache.0.get(&cache_key) {
+        Ok(*score)
+    } else {
+        let client = reqwest::Client::new();
+        let score = client
+            .post(MATCH_URL)
+            .form(&request)
+            .send()
+            .await?
+            .json::<MatchResult>()
+            .await?
+            .score;
+        cache.0.insert(cache_key, score);
+        Ok(score)
+    }
 }
 
-type Context<'a> = poise::Context<'a, RwLock<GlobalData>, anyhow::Error>;
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct Matchup(String, String);
+
+impl Matchup {
+    fn new(a: String, b: String) -> Matchup {
+        if a < b {
+            Matchup(a, b)
+        } else {
+            Matchup(b, a)
+        }
+    }
+}
+impl From<MatchRequest> for Matchup {
+    fn from(value: MatchRequest) -> Self {
+        Matchup::new(value.person, value.partner)
+    }
+}
+
+#[derive(Default)]
+struct Cache(HashMap<Matchup, u32>);
+
+impl Cache {
+    fn new() -> Self {
+        Cache::default()
+    }
+}
+
+struct GlobalState {
+    data: RwLock<GlobalData>,
+    cache: Mutex<Cache>,
+}
+
+type Context<'a> = poise::Context<'a, GlobalState, anyhow::Error>;
+
 #[poise::command(slash_command)]
 /// Adds a result from bdsmtest.org. A headmate can also be provided if they took the test on their own.
 async fn add_bdsm_result(
@@ -136,7 +169,7 @@ async fn add_bdsm_result(
     let guild_id = ctx
         .guild_id()
         .ok_or_else(|| anyhow::anyhow!("No guild id. Must be in a guild"))?;
-    let mut data = ctx.data().write().await;
+    let mut data = ctx.data().data.write().await;
 
     {
         let guild = data.guild_mut(guild_id);
@@ -168,7 +201,7 @@ async fn remove_bdsm_results(
     let guild_id = ctx
         .guild_id()
         .ok_or_else(|| anyhow::anyhow!("No guild id. Must be in a guild"))?;
-    let mut data = ctx.data().write().await;
+    let mut data = ctx.data().data.write().await;
 
     {
         let guild = data.guild_mut(guild_id);
@@ -212,7 +245,7 @@ async fn list_compatibility(
     let guild_id = ctx
         .guild_id()
         .ok_or_else(|| anyhow::anyhow!("No guild id. Must be in a guild"))?;
-    let data = ctx.data().read().await;
+    let data = ctx.data().data.read().await;
     let guild = data.guild(guild_id).ok_or_else(|| {
         anyhow::anyhow!("No data registered for this guild, use add_bdsm_result first")
     })?;
@@ -262,16 +295,19 @@ async fn list_compatibility(
         };
 
         if let Some(primary) = &person.primary {
-            let score = get_match(MatchRequest {
-                person: most_recent.clone(),
-                partner: primary
-                    .results
-                    .iter()
-                    .max_by_key(|h| h.0)
-                    .expect("no partner result")
-                    .1
-                    .clone(),
-            })
+            let score = get_match(
+                &mut *ctx.data().cache.lock().await,
+                MatchRequest {
+                    person: most_recent.clone(),
+                    partner: primary
+                        .results
+                        .iter()
+                        .max_by_key(|h| h.0)
+                        .expect("no partner result")
+                        .1
+                        .clone(),
+                },
+            )
             .await
             .map(|score| score as i32)
             .unwrap_or_else(|_| -1);
@@ -280,16 +316,19 @@ async fn list_compatibility(
 
         for (headmate_name, headmate) in &person.headmates {
             let name = format!("{member_name} ({headmate_name})",);
-            let score = get_match(MatchRequest {
-                person: most_recent.clone(),
-                partner: headmate
-                    .results
-                    .iter()
-                    .max_by_key(|h| h.0)
-                    .expect("no partner result")
-                    .1
-                    .clone(),
-            })
+            let score = get_match(
+                &mut *ctx.data().cache.lock().await,
+                MatchRequest {
+                    person: most_recent.clone(),
+                    partner: headmate
+                        .results
+                        .iter()
+                        .max_by_key(|h| h.0)
+                        .expect("no partner result")
+                        .1
+                        .clone(),
+                },
+            )
             .await
             .map(|score| score as i32)
             .unwrap_or_else(|_| -1);
@@ -348,7 +387,10 @@ async fn main() -> Result<(), anyhow::Error> {
                     serde_json::from_str(&std::fs::read_to_string(REGISTRY).unwrap_or_default())?;
                 results.migrate();
                 let _ = persist(&results);
-                Ok(RwLock::new(results))
+                Ok(GlobalState {
+                    data: RwLock::new(results),
+                    cache: Mutex::new(Cache::new()),
+                })
             })
         })
         .build();
