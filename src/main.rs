@@ -9,6 +9,7 @@ use tokio::sync::RwLock;
 
 const MATCH_URL: &str = "https://bdsmtest.org/ajax/match";
 const REGISTRY: &str = "registry.toml";
+const REGISTRY_BKU: &str = "registry.bku.toml";
 
 #[derive(Debug, Deserialize)]
 struct MatchResult {
@@ -38,9 +39,30 @@ struct HeadmateData {
 #[derive(Default, Debug, Serialize, Deserialize)]
 struct UserData(Vec<HeadmateData>);
 
+impl UserData {
+    pub fn headmate(&self, name: &Option<String>) -> Option<&HeadmateData> {
+        self.0.iter().find(|h| h.name == *name)
+    }
+
+    pub fn headmate_mut(&mut self, name: &Option<String>) -> &mut HeadmateData {
+        let headmate_index = self
+            .0
+            .iter()
+            .position(|h| h.name == *name)
+            .unwrap_or_else(|| {
+                self.0.push(HeadmateData {
+                    name: name.clone(),
+                    results: BTreeMap::new(),
+                });
+                self.0.len() - 1
+            });
+        self.0.get_mut(headmate_index).unwrap()
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct GuildData {
-    guild_id: u64,
+    guild_id: serenity::GuildId,
 
     person: BTreeMap<serenity::UserId, UserData>,
 }
@@ -50,7 +72,29 @@ struct GlobalData {
     guild: Vec<GuildData>,
 }
 
+impl GlobalData {
+    pub fn guild(&self, id: serenity::GuildId) -> Option<&GuildData> {
+        self.guild.iter().find(|guild| guild.guild_id == id)
+    }
+
+    pub fn guild_mut(&mut self, guild_id: serenity::GuildId) -> &mut GuildData {
+        let guild_index = self
+            .guild
+            .iter()
+            .position(|guild| guild.guild_id == guild_id)
+            .unwrap_or_else(|| {
+                self.guild.push(GuildData {
+                    guild_id,
+                    person: BTreeMap::new(),
+                });
+                self.guild.len() - 1
+            });
+        self.guild.get_mut(guild_index).unwrap()
+    }
+}
+
 fn persist(data: &GlobalData) -> Result<(), anyhow::Error> {
+    let _ = std::fs::copy(REGISTRY, REGISTRY_BKU);
     let mut output = std::fs::File::create(REGISTRY).context("while opening data file")?;
     write!(
         output,
@@ -76,6 +120,7 @@ async fn get_match(request: MatchRequest) -> Result<u32, anyhow::Error> {
 
 type Context<'a> = poise::Context<'a, RwLock<GlobalData>, anyhow::Error>;
 #[poise::command(slash_command)]
+/// Adds a result from bdsmtest.org. A headmate can also be provided if they took the test on their own.
 async fn add_bdsm_result(
     ctx: Context<'_>,
     #[description = "Headmate Name"] headmate: Option<String>,
@@ -83,41 +128,18 @@ async fn add_bdsm_result(
     #[rest]
     id: String,
 ) -> Result<(), anyhow::Error> {
-    let location_id = ctx
+    let guild_id = ctx
         .guild_id()
-        .map(|g| g.get())
-        .unwrap_or(ctx.channel_id().get());
+        .ok_or_else(|| anyhow::anyhow!("No guild id. Must be in a guild"))?;
     let mut data = ctx.data().write().await;
 
     {
-        let guild_index = data
-            .guild
-            .iter()
-            .position(|guild| guild.guild_id == location_id)
-            .unwrap_or_else(|| {
-                data.guild.push(GuildData {
-                    guild_id: location_id,
-                    person: BTreeMap::new(),
-                });
-                data.guild.len() - 1
-            });
-        let guild = data.guild.get_mut(guild_index).unwrap();
+        let guild = data.guild_mut(guild_id);
         let person_data = guild
             .person
             .entry(ctx.author().id)
             .or_insert_with(UserData::default);
-        let headmate_index = person_data
-            .0
-            .iter()
-            .position(|h| h.name == headmate)
-            .unwrap_or_else(|| {
-                person_data.0.push(HeadmateData {
-                    name: headmate,
-                    results: BTreeMap::new(),
-                });
-                person_data.0.len() - 1
-            });
-        let headmate_data = person_data.0.get_mut(headmate_index).unwrap();
+        let headmate_data = person_data.headmate_mut(&headmate);
         headmate_data.results.insert(Utc::now(), id);
     }
 
@@ -136,25 +158,13 @@ async fn remove_bdsm_results(
     ctx: Context<'_>,
     #[description = "Headmate Name"] headmate: Option<String>,
 ) -> Result<(), anyhow::Error> {
-    let location_id = ctx
+    let guild_id = ctx
         .guild_id()
-        .map(|g| g.get())
-        .unwrap_or(ctx.channel_id().get());
+        .ok_or_else(|| anyhow::anyhow!("No guild id. Must be in a guild"))?;
     let mut data = ctx.data().write().await;
 
     {
-        let guild_index = data
-            .guild
-            .iter()
-            .position(|guild| guild.guild_id == location_id)
-            .unwrap_or_else(|| {
-                data.guild.push(GuildData {
-                    guild_id: location_id,
-                    person: BTreeMap::new(),
-                });
-                data.guild.len() - 1
-            });
-        let guild = data.guild.get_mut(guild_index).unwrap();
+        let guild = data.guild_mut(guild_id);
         let person_data = guild
             .person
             .entry(ctx.author().id)
@@ -176,31 +186,24 @@ async fn remove_bdsm_results(
 }
 
 #[poise::command(slash_command)]
-/// List the compatibility of yourself and everyone else.
+/// List the compatibility of yourself and everyone else (including headmates).
 async fn list_compatibility(
     ctx: Context<'_>,
     #[description = "Headmate Name"] headmate: Option<String>,
 ) -> Result<(), anyhow::Error> {
-    let location_id = ctx
+    let guild_id = ctx
         .guild_id()
-        .map(|g| g.get())
-        .unwrap_or(ctx.channel_id().get());
+        .ok_or_else(|| anyhow::anyhow!("No guild id. Must be in a guild"))?;
     let data = ctx.data().read().await;
-    let guild = data
-        .guild
-        .iter()
-        .find(|g| g.guild_id == location_id)
-        .ok_or_else(|| {
-            anyhow::anyhow!("No data registered for this guild, use add_bdsm_result first")
-        })?;
+    let guild = data.guild(guild_id).ok_or_else(|| {
+        anyhow::anyhow!("No data registered for this guild, use add_bdsm_result first")
+    })?;
 
     let person = guild.person.get(&ctx.author().id).ok_or_else(|| {
         anyhow::anyhow!("You have not registered any results. Use add_bdsm_result first")
     })?;
     let headmate_data = person
-        .0
-        .iter()
-        .find(|h| h.name == headmate)
+        .headmate(&headmate)
         .ok_or_else(|| anyhow::anyhow!("Could not find headmate {headmate:?}"))?;
     let most_recent = headmate_data
         .results
@@ -243,7 +246,13 @@ async fn list_compatibility(
         };
 
         for headmate in &person.0 {
-            let name = headmate.name.as_ref().unwrap_or(&member_name);
+            let name = format!(
+                "{member_name}{}",
+                match headmate.name {
+                    Some(ref name) => format!(" ({name})"),
+                    None => String::new(),
+                }
+            );
             let score = get_match(MatchRequest {
                 person: most_recent.clone(),
                 partner: headmate
