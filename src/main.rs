@@ -3,13 +3,16 @@ use std::io::Write;
 
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
-use poise::serenity_prelude as serenity;
+use poise::{
+    serenity_prelude::{self as serenity, Mentionable},
+    CreateReply,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 const MATCH_URL: &str = "https://bdsmtest.org/ajax/match";
-const REGISTRY: &str = "registry.toml";
-const REGISTRY_BKU: &str = "registry.bku.toml";
+const REGISTRY: &str = "registry.json";
+const REGISTRY_BKU: &str = "registry.bku.json";
 
 #[derive(Debug, Deserialize)]
 struct MatchResult {
@@ -30,78 +33,78 @@ struct TestResult {
     person: BTreeMap<String, BTreeMap<DateTime<Utc>, String>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Default, Debug, Serialize, Deserialize)]
 struct HeadmateData {
-    name: Option<String>,
     results: BTreeMap<DateTime<Utc>, String>,
 }
 
-#[derive(Default, Debug, Serialize, Deserialize)]
-struct UserData(Vec<HeadmateData>);
+impl HeadmateData {
+    fn migrate(&mut self) {}
+}
+
+#[derive(Clone, Default, Debug, Serialize, Deserialize)]
+struct UserData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    primary: Option<HeadmateData>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    headmates: BTreeMap<String, HeadmateData>,
+}
 
 impl UserData {
+    fn migrate(&mut self) {
+        self.primary.iter_mut().for_each(HeadmateData::migrate);
+        self.headmates.values_mut().for_each(HeadmateData::migrate)
+    }
+
     pub fn headmate(&self, name: &Option<String>) -> Option<&HeadmateData> {
-        self.0.iter().find(|h| h.name == *name)
+        match name {
+            Some(name) => self.headmates.get(name),
+            None => self.primary.as_ref(),
+        }
     }
 
     pub fn headmate_mut(&mut self, name: &Option<String>) -> &mut HeadmateData {
-        let headmate_index = self
-            .0
-            .iter()
-            .position(|h| h.name == *name)
-            .unwrap_or_else(|| {
-                self.0.push(HeadmateData {
-                    name: name.clone(),
-                    results: BTreeMap::new(),
-                });
-                self.0.len() - 1
-            });
-        self.0.get_mut(headmate_index).unwrap()
+        match name {
+            Some(name) => self.headmates.entry(name.clone()).or_default(),
+            None => self.primary.get_or_insert_with(HeadmateData::default),
+        }
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Default, Debug, Serialize, Deserialize)]
 struct GuildData {
-    guild_id: serenity::GuildId,
+    users: BTreeMap<serenity::UserId, UserData>,
+}
 
-    person: BTreeMap<serenity::UserId, UserData>,
+impl GuildData {
+    fn migrate(&mut self) {
+        self.users.values_mut().for_each(UserData::migrate)
+    }
 }
 
 #[derive(Default, Debug, Serialize, Deserialize)]
 struct GlobalData {
-    guild: Vec<GuildData>,
+    guilds: BTreeMap<serenity::GuildId, GuildData>,
 }
 
 impl GlobalData {
+    fn migrate(&mut self) {
+        self.guilds.values_mut().for_each(GuildData::migrate);
+    }
+
     pub fn guild(&self, id: serenity::GuildId) -> Option<&GuildData> {
-        self.guild.iter().find(|guild| guild.guild_id == id)
+        self.guilds.get(&id)
     }
 
     pub fn guild_mut(&mut self, guild_id: serenity::GuildId) -> &mut GuildData {
-        let guild_index = self
-            .guild
-            .iter()
-            .position(|guild| guild.guild_id == guild_id)
-            .unwrap_or_else(|| {
-                self.guild.push(GuildData {
-                    guild_id,
-                    person: BTreeMap::new(),
-                });
-                self.guild.len() - 1
-            });
-        self.guild.get_mut(guild_index).unwrap()
+        self.guilds.entry(guild_id).or_default()
     }
 }
 
 fn persist(data: &GlobalData) -> Result<(), anyhow::Error> {
     let _ = std::fs::copy(REGISTRY, REGISTRY_BKU);
     let mut output = std::fs::File::create(REGISTRY).context("while opening data file")?;
-    write!(
-        output,
-        "{}",
-        toml::to_string_pretty(data).context("While formatting toml")?
-    )
-    .context("While writing data to disk")?;
+    serde_json::to_writer_pretty(&mut output, data).context("while formatting json")?;
 
     Ok(())
 }
@@ -128,6 +131,8 @@ async fn add_bdsm_result(
     #[rest]
     id: String,
 ) -> Result<(), anyhow::Error> {
+    ctx.defer_ephemeral().await?;
+
     let guild_id = ctx
         .guild_id()
         .ok_or_else(|| anyhow::anyhow!("No guild id. Must be in a guild"))?;
@@ -136,7 +141,7 @@ async fn add_bdsm_result(
     {
         let guild = data.guild_mut(guild_id);
         let person_data = guild
-            .person
+            .users
             .entry(ctx.author().id)
             .or_insert_with(UserData::default);
         let headmate_data = person_data.headmate_mut(&headmate);
@@ -158,6 +163,8 @@ async fn remove_bdsm_results(
     ctx: Context<'_>,
     #[description = "Headmate Name"] headmate: Option<String>,
 ) -> Result<(), anyhow::Error> {
+    ctx.defer_ephemeral().await?;
+
     let guild_id = ctx
         .guild_id()
         .ok_or_else(|| anyhow::anyhow!("No guild id. Must be in a guild"))?;
@@ -166,19 +173,28 @@ async fn remove_bdsm_results(
     {
         let guild = data.guild_mut(guild_id);
         let person_data = guild
-            .person
+            .users
             .entry(ctx.author().id)
             .or_insert_with(UserData::default);
-        if let Some(headmate_index) = person_data.0.iter().position(|h| h.name == headmate) {
-            person_data.0.swap_remove(headmate_index);
-        } else {
-            return Err(anyhow::anyhow!("No entries found for ({headmate:?})"));
+        match headmate {
+            Some(headmate) => {
+                person_data
+                    .headmates
+                    .remove(&headmate)
+                    .ok_or_else(|| anyhow::anyhow!("No entries found for ({headmate})"))?;
+            }
+            None => {
+                person_data
+                    .primary
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("No data for primary entry"))?;
+            }
         }
     }
 
     persist(&data)?;
 
-    ctx.reply("Entries removed")
+    ctx.reply("Entries Removed")
         .await
         .context("while sending reply")?;
 
@@ -191,6 +207,8 @@ async fn list_compatibility(
     ctx: Context<'_>,
     #[description = "Headmate Name"] headmate: Option<String>,
 ) -> Result<(), anyhow::Error> {
+    ctx.defer().await?;
+
     let guild_id = ctx
         .guild_id()
         .ok_or_else(|| anyhow::anyhow!("No guild id. Must be in a guild"))?;
@@ -199,7 +217,7 @@ async fn list_compatibility(
         anyhow::anyhow!("No data registered for this guild, use add_bdsm_result first")
     })?;
 
-    let person = guild.person.get(&ctx.author().id).ok_or_else(|| {
+    let person = guild.users.get(&ctx.author().id).ok_or_else(|| {
         anyhow::anyhow!("You have not registered any results. Use add_bdsm_result first")
     })?;
     let headmate_data = person
@@ -231,28 +249,37 @@ async fn list_compatibility(
             })
     );
     let mut results = Vec::new();
-    for (&user_id, person) in &guild.person {
+    for (&user_id, person) in &guild.users {
         ctx.defer().await?;
-        if user_id == ctx.author().id {
-            continue;
-        }
-        let member_name = match ctx.guild_id() {
-            Some(g) => match g.member(ctx, user_id).await {
-                Ok(user) => user.display_name().to_string(),
-                Err(_) if user_id.get() == 1 => "".to_string(),
-                Err(_) => "Deleted User".to_string(),
-            },
-            None => return Err(anyhow::anyhow!("Not in a guild")),
+        // if user_id == ctx.author().id {
+        //     continue;
+        // }
+        let member_name = match guild_id.member(ctx, user_id).await {
+            Ok(user) => user.mention().to_string(),
+            // user.display_name().to_string(),
+            Err(_) if user_id.get() == 1 => "".to_string(),
+            Err(_) => "Deleted User".to_string(),
         };
 
-        for headmate in &person.0 {
-            let name = format!(
-                "{member_name}{}",
-                match headmate.name {
-                    Some(ref name) => format!(" ({name})"),
-                    None => String::new(),
-                }
-            );
+        if let Some(primary) = &person.primary {
+            let score = get_match(MatchRequest {
+                person: most_recent.clone(),
+                partner: primary
+                    .results
+                    .iter()
+                    .max_by_key(|h| h.0)
+                    .expect("no partner result")
+                    .1
+                    .clone(),
+            })
+            .await
+            .map(|score| score as i32)
+            .unwrap_or_else(|_| -1);
+            results.push((score, member_name.to_string()));
+        }
+
+        for (headmate_name, headmate) in &person.headmates {
+            let name = format!("{member_name} ({headmate_name})",);
             let score = get_match(MatchRequest {
                 person: most_recent.clone(),
                 partner: headmate
@@ -282,7 +309,13 @@ async fn list_compatibility(
         );
     }
 
-    ctx.reply(response).await?;
+    ctx.send(
+        poise::CreateReply::default()
+            .content(response)
+            .reply(true)
+            .allowed_mentions(serenity::CreateAllowedMentions::new()),
+    )
+    .await?;
 
     Ok(())
 }
@@ -311,9 +344,10 @@ async fn main() -> Result<(), anyhow::Error> {
         .setup(|ctx, _ready, framework| {
             Box::pin(async move {
                 poise::builtins::register_globally(ctx, &framework.options().commands).await?;
-                let results: GlobalData =
-                    toml::from_str(&std::fs::read_to_string(REGISTRY).unwrap_or_default())
-                        .unwrap_or_default();
+                let mut results: GlobalData =
+                    serde_json::from_str(&std::fs::read_to_string(REGISTRY).unwrap_or_default())?;
+                results.migrate();
+                let _ = persist(&results);
                 Ok(RwLock::new(results))
             })
         })
