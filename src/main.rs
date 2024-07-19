@@ -4,9 +4,10 @@ use std::collections::{BTreeMap, HashMap};
 
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
-use poise::serenity_prelude::{self as serenity, Mentionable};
+use poise::serenity_prelude as serenity;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
+use tracing::{info, instrument};
 
 const MATCH_URL: &str = "https://bdsmtest.org/ajax/match";
 const REGISTRY: &str = "registry.json";
@@ -155,15 +156,43 @@ struct GlobalState {
 
 type Context<'a> = poise::Context<'a, GlobalState, anyhow::Error>;
 
-#[poise::command(slash_command)]
+async fn autocomplete_headmate(ctx: Context<'_>, partial: &str) -> Vec<String> {
+    let guild_id = match ctx.guild_id() {
+        Some(g) => g,
+        None => return vec![],
+    };
+    let data = ctx.data().data.read().await;
+    let guild_data = match data.guild(guild_id) {
+        Some(g) => g,
+        None => return vec![],
+    };
+    let person_data = match guild_data.users.get(&ctx.author().id) {
+        Some(p) => p,
+        None => return vec![],
+    };
+
+    person_data
+        .headmates
+        .keys()
+        .filter(|k| k.starts_with(partial))
+        .cloned()
+        .collect()
+}
+
+#[instrument(skip(ctx), err, fields(guild = ctx.guild().unwrap().name, user = ctx.author().name))]
+#[poise::command(slash_command, ephemeral = true, guild_only = true)]
 /// Adds a result from bdsmtest.org. A headmate can also be provided if they took the test on their own.
 async fn add_bdsm_result(
     ctx: Context<'_>,
-    #[description = "Headmate Name"] headmate: Option<String>,
+    #[description = "Headmate Name"]
+    #[autocomplete = "autocomplete_headmate"]
+    headmate: Option<String>,
     #[description = "The result ID from bdsmtest.org"]
     #[rest]
     id: String,
 ) -> Result<(), anyhow::Error> {
+    info!("Adding bdsmtest.org result");
+
     ctx.defer_ephemeral().await?;
 
     let guild_id = ctx
@@ -190,12 +219,17 @@ async fn add_bdsm_result(
     Ok(())
 }
 
-#[poise::command(slash_command)]
+#[instrument(skip(ctx), err, fields(guild = ctx.guild().unwrap().name, user = ctx.author().name))]
+#[poise::command(slash_command, ephemeral = true, guild_only = true)]
 /// Removes the entries for the current user (or one of their headmates)
 async fn remove_bdsm_results(
     ctx: Context<'_>,
-    #[description = "Headmate Name"] headmate: Option<String>,
+    #[description = "Headmate Name"]
+    #[autocomplete = "autocomplete_headmate"]
+    headmate: Option<String>,
 ) -> Result<(), anyhow::Error> {
+    info!("Attempting to remove data");
+
     ctx.defer_ephemeral().await?;
 
     let guild_id = ctx
@@ -234,12 +268,16 @@ async fn remove_bdsm_results(
     Ok(())
 }
 
-#[poise::command(slash_command)]
+#[instrument(skip(ctx), err, fields(guild = ctx.guild().unwrap().name, user = ctx.author().name))]
+#[poise::command(slash_command, guild_only = true)]
 /// List the compatibility of yourself and everyone else (including headmates).
 async fn list_compatibility(
     ctx: Context<'_>,
-    #[description = "Headmate Name"] headmate: Option<String>,
+    #[description = "Headmate Name"]
+    #[autocomplete = "autocomplete_headmate"]
+    headmate: Option<String>,
 ) -> Result<(), anyhow::Error> {
+    info!("Starting List");
     ctx.defer().await?;
 
     let guild_id = ctx
@@ -288,10 +326,13 @@ async fn list_compatibility(
         //     continue;
         // }
         let member_name = match guild_id.member(ctx, user_id).await {
-            Ok(user) => user.mention().to_string(),
-            // user.display_name().to_string(),
+            Ok(user) =>
+            // user.mention().to_string(),
+            {
+                format!("**{}**", user.display_name())
+            }
             Err(_) if user_id.get() == 1 => "".to_string(),
-            Err(_) => "Deleted User".to_string(),
+            Err(_) => "**Deleted User**".to_string(),
         };
 
         if let Some(primary) = &person.primary {
@@ -355,6 +396,8 @@ async fn list_compatibility(
             .allowed_mentions(serenity::CreateAllowedMentions::new()),
     )
     .await?;
+
+    info!("List Complete");
 
     Ok(())
 }
