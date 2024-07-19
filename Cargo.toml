@@ -1,0 +1,17 @@
+[package]
+name = "bdsm-cmp-bot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.86"
+chrono = { version = "0.4.38", features = ["serde"] }
+dotenv = "0.15.0"
+poise = "0.6.1"
+reqwest = { version = "0.12.5", features = ["json"] }
+serde = { version = "1.0.204", features = ["derive"] }
+serde_json = "1.0.120"
+tokio = { version = "1.38.1", features = ["full"] }
+toml = "0.8.15"
+tracing = "0.1.40"
+tracing-subscriber = "0.3.18"
