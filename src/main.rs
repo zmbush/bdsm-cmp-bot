@@ -372,6 +372,7 @@ async fn remove_bdsm_results(
 
 #[instrument(skip(ctx), err, fields(guild = ctx.guild().unwrap().name, user = ctx.author().name))]
 #[poise::command(slash_command, guild_only = true)]
+/// Display all of the results registered to the current user.
 async fn show_result(
     ctx: Context<'_>,
     #[description = "Headmate Name"]
