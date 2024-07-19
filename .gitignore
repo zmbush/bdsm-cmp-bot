@@ -15,6 +15,8 @@ Cargo.lock
 .env
 registry.toml
 registry.bku.toml
+logs
 registry.json
 registry.bku.json
 *.untrack
+bku

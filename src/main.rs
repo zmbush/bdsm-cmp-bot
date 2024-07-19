@@ -1,6 +1,9 @@
 #![deny(unused)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+};
 
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
@@ -8,10 +11,10 @@ use poise::serenity_prelude as serenity;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{info, instrument};
+use tracing_subscriber::{layer::SubscriberExt as _, Layer as _, Registry};
 
 const MATCH_URL: &str = "https://bdsmtest.org/ajax/match";
 const REGISTRY: &str = "registry.json";
-const REGISTRY_BKU: &str = "registry.bku.json";
 
 #[derive(Debug, Deserialize)]
 struct MatchResult {
@@ -95,10 +98,55 @@ impl GlobalData {
     }
 }
 
+fn persist_folder<P: AsRef<Path>, P2: AsRef<Path>>(
+    folder: P,
+    filename: P2,
+    keep: usize,
+) -> std::io::Result<()> {
+    let folder = folder.as_ref();
+    std::fs::create_dir_all(folder)?;
+    if !Path::is_file(REGISTRY.as_ref()) {
+        return Ok(());
+    }
+    std::fs::copy(REGISTRY, folder.join(filename))?;
+    let mut existing: Vec<_> = std::fs::read_dir(folder)?.collect::<Result<_, _>>()?;
+    existing.sort_by_key(|f| f.path());
+
+    let count = existing.len();
+    if count > keep {
+        for file in existing.into_iter().take(count - keep) {
+            std::fs::remove_file(file.path())?;
+        }
+    }
+
+    Ok(())
+}
+
 fn persist(data: &GlobalData) -> Result<(), anyhow::Error> {
-    let _ = std::fs::copy(REGISTRY, REGISTRY_BKU);
+    let now = Utc::now();
+    persist_folder(
+        "bku/history",
+        format!("registry-{}.json", now.timestamp()),
+        20,
+    )?;
     let mut output = std::fs::File::create(REGISTRY).context("while opening data file")?;
     serde_json::to_writer_pretty(&mut output, data).context("while formatting json")?;
+
+    persist_folder(
+        "bku/hourly",
+        format!("registry-{}.json", now.timestamp() / 60 / 60),
+        24,
+    )?;
+    persist_folder(
+        "bku/daily",
+        format!("registry-{}.json", now.timestamp() / 60 / 60 / 24),
+        30,
+    )?;
+    persist_folder(
+        "bku/monthly",
+        format!("registry-{}.json", now.timestamp() / 60 / 60 / 24 / 28),
+        usize::MAX,
+    )?;
 
     Ok(())
 }
@@ -404,10 +452,36 @@ async fn list_compatibility(
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_target(false)
-        .init();
+    let appender = tracing_appender::rolling::RollingFileAppender::builder()
+        .max_log_files(10)
+        .filename_prefix("rolling")
+        .filename_suffix("log")
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .build("logs")?;
+
+    let subscriber = Registry::default()
+        .with(
+            // Stdout
+            tracing_subscriber::fmt::layer()
+                .compact()
+                .with_ansi(true)
+                .with_filter(tracing::level_filters::LevelFilter::from_level(
+                    tracing::Level::INFO,
+                )),
+        )
+        .with(
+            // Rolling logs
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(appender)
+                .with_filter(
+                    tracing_subscriber::filter::Targets::new()
+                        .with_target("bdsm-cmp-bot", tracing::Level::TRACE)
+                        .with_default(tracing::Level::DEBUG),
+                ),
+        );
+
+    tracing::subscriber::set_global_default(subscriber)?;
 
     dotenv::dotenv()?;
 
