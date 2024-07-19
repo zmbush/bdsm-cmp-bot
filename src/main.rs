@@ -378,6 +378,7 @@ async fn show_result(
     #[autocomplete = "autocomplete_headmate"]
     headmate: Option<String>,
 ) -> Result<(), anyhow::Error> {
+    info!("Fetching results");
     ctx.defer().await?;
 
     let guild_id = ctx
