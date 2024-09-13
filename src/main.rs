@@ -378,9 +378,15 @@ async fn show_result(
     #[description = "Headmate Name"]
     #[autocomplete = "autocomplete_headmate"]
     headmate: Option<String>,
+    #[description = "Respond in public to the server (defaults to true)"] public: Option<bool>,
 ) -> Result<(), anyhow::Error> {
+    let public = public.unwrap_or(true);
     info!("Fetching results");
-    ctx.defer().await?;
+    if public {
+        ctx.defer().await?;
+    } else {
+        ctx.defer_ephemeral().await?;
+    }
 
     let guild_id = ctx
         .guild_id()
@@ -396,24 +402,25 @@ async fn show_result(
     let headmate_data = person
         .headmate(&headmate)
         .ok_or_else(|| anyhow::anyhow!("Could not find headmate {headmate:?}"))?;
-    for result in headmate_data.results.values() {
-        let result = match get_result(result).await {
+    for result_id in headmate_data.results.values() {
+        let result = match get_result(result_id).await {
             Ok(result) => result,
             Err(e) => {
-                ctx.reply(format!("Could not get result for {result}: {e}"))
+                ctx.reply(format!("Could not get result for {result_id}: {e}"))
                     .await?;
                 continue;
             }
         };
         let mut response = format!(
-            "```==== {} {}({}) ====\n",
+            "```==== {} {}({}) {} ====\n",
             ctx.author().name,
             if let Some(ref hm) = headmate {
                 format!("({hm}) ")
             } else {
                 String::new()
             },
-            result.date
+            result.date,
+            result_id
         );
         for score in result.scores {
             response += &format!("{:-30} {:02}%\n", score.name, score.score);
