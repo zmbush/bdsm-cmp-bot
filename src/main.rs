@@ -20,28 +20,17 @@ const REGISTRY: &str = "registry.json";
 #[derive(Debug, Deserialize)]
 struct MatchResult {
     score: u32,
-    #[allow(unused)]
-    partner: String,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(unused)]
 struct GetResultScore {
-    id: u32,
     name: String,
-    pairdesc: String,
-    description: String,
     score: u32,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(unused)]
 struct GetResultResult {
-    langfile: String,
     date: String,
-    version: u32,
-    gender: String,
-    auth: bool,
     scores: Vec<GetResultScore>,
 }
 
@@ -62,6 +51,7 @@ struct GetResultRequest {
     salt: &'static str,
     #[serde(rename = "uauth[authsig]")]
     authsig: &'static str,
+    lang: &'static str,
 }
 
 #[derive(Clone, Default, Debug, Serialize, Deserialize)]
@@ -193,15 +183,11 @@ async fn get_result<S: Into<String>>(user: S) -> Result<GetResultResult, anyhow:
         uid: "0",
         salt: "",
         authsig: "814a69afc15258000678f00526b0c107ac271b5ea997beb4f7c1e81c861c972b",
+        lang: "EN",
     };
 
-    Ok(client
-        .post(RESULT_URL)
-        .form(&req)
-        .send()
-        .await?
-        .json()
-        .await?)
+    let response = client.post(RESULT_URL).form(&req).send().await?;
+    Ok(response.json().await?)
 }
 
 async fn get_match(cache: &mut Cache, request: MatchRequest) -> Result<u32, anyhow::Error> {
@@ -616,8 +602,10 @@ async fn main() -> Result<(), anyhow::Error> {
         .setup(|ctx, _ready, framework| {
             Box::pin(async move {
                 poise::builtins::register_globally(ctx, &framework.options().commands).await?;
-                let mut results: GlobalData =
-                    serde_json::from_str(&std::fs::read_to_string(REGISTRY).unwrap_or_default())?;
+                let mut results: GlobalData = match std::fs::read_to_string(REGISTRY) {
+                    Ok(contents) => serde_json::from_str(&contents)?,
+                    Err(_) => GlobalData::default(),
+                };
                 results.migrate();
                 let _ = persist(&results);
                 Ok(GlobalState {
